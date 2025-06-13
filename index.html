@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+    <script src="https://unpkg.com/obniz/obniz.js"></script>
+    <title>音声LEDコントロール</title>
+    <style>
+      .container {
+        max-width: 600px;
+        margin: 0 auto;
+        text-align: center;
+      }
+      .volume-meter {
+        width: 300px;
+        height: 20px;
+        background-color: #ddd;
+        margin: 20px auto;
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .volume-level {
+        width: 0%;
+        height: 100%;
+        background-color: #4CAF50;
+        transition: width 0.1s ease;
+      }
+      .controls {
+        margin: 20px 0;
+      }
+      button {
+        padding: 10px 20px;
+        font-size: 16px;
+        margin: 0 10px;
+        cursor: pointer;
+      }
+      .mode-indicator {
+        font-size: 24px;
+        margin: 20px 0;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: #f0f0f0;
+      }
+      .threshold-control {
+        margin: 20px 0;
+      }
+      .threshold-control input {
+        width: 200px;
+      }
+      .voice-status {
+        margin: 10px 0;
+        padding: 10px;
+        background-color: #f0f0f0;
+        border-radius: 5px;
+      }
+      .voice-command {
+        color: #4CAF50;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="obniz-debug"></div>
+    <div class="container">
+      <h1>音声LEDコントロール</h1>
+      <div id="connection-status">接続状態: 未接続</div>
+      <div id="connection-time">接続時間: 0秒</div>
+      <div id="error-log" style="color: red; margin-top: 10px;"></div>
+      
+      <div class="controls">
+        <button id="start-audio">マイク開始</button>
+        <button id="stop-audio">マイク停止</button>
+        <button id="start-voice">音声認識開始</button>
+        <button id="stop-voice">音声認識停止</button>
+      </div>
+      
+      <div class="threshold-control">
+        <label for="threshold">音声トリガー閾値: <span id="threshold-value">50</span>%</label>
+        <input type="range" id="threshold" min="0" max="100" value="50">
+      </div>
+      
+      <div class="mode-indicator">
+        現在のモード: <span id="current-mode">通常モード</span>
+      </div>
+      
+      <div class="voice-status">
+        音声認識状態: <span id="voice-status">停止中</span>
+      </div>
+      
+      <div class="volume-meter">
+        <div id="volume-level" class="volume-level"></div>
+      </div>
+      
+      <div id="volume-value">音量: 0</div>
+    </div>
+
+    <script>
+      let connectionStartTime = null;
+      let leds;
+      let audioContext;
+      let analyser;
+      let microphone;
+      let isAudioActive = false;
+      let recognition;
+      let isListening = false;
+      const LED_length = 15;
+      let currentMode = 'normal'; // 'normal' or 'color'
+      let lastTriggerTime = 0;
+      const TRIGGER_COOLDOWN = 1000; // トリガーのクールダウン時間（ミリ秒）
+      const VOICE_COMMANDS = {
+        'カラーモード': 'color',
+        '通常モード': 'normal',
+        'モード切替': 'toggle'
+      };
+
+      function updateConnectionTime() {
+        if (connectionStartTime) {
+          const now = new Date();
+          const diff = Math.floor((now - connectionStartTime) / 1000);
+          const minutes = Math.floor(diff / 60);
+          const seconds = diff % 60;
+          document.getElementById('connection-time').textContent = 
+              `接続時間: ${minutes}分 ${seconds}秒`;
+        }
+      }
+
+      function updateStatus(status, isConnected = false) {
+        const statusElement = document.getElementById('connection-status');
+        statusElement.textContent = `接続状態: ${status}`;
+        statusElement.style.color = isConnected ? 'green' : 'red';
+      }
+
+      function logError(error) {
+        const errorLog = document.getElementById('error-log');
+        const timestamp = new Date().toLocaleTimeString();
+        errorLog.innerHTML = `[${timestamp}] ${error}<br>` + errorLog.innerHTML;
+        console.error("Obnizエラー詳細:", error);
+      }
+
+      const obniz = new Obniz("4964-9731", {
+        auto_connect: true,
+        reset_obniz_on_ws_disconnection: false,
+        connection_timeout: 10000,
+        debug: true,
+        reset_on_disconnect: false,
+        binary: true
+      });
+
+      function isConnected() {
+        return obniz && obniz.connectionState === 'connected';
+      }
+
+      function toggleMode() {
+        currentMode = currentMode === 'normal' ? 'color' : 'normal';
+        document.getElementById('current-mode').textContent = 
+          currentMode === 'normal' ? '通常モード' : 'カラーモード';
+      }
+
+      function updateLED(color) {
+        if (leds) {
+          leds.rgbs(Array(LED_length).fill(color));
+        }
+      }
+
+      function getColorModeColor() {
+        const hue = (Date.now() / 20) % 360;
+        const rgb = hslToRgb(hue / 360, 1, 0.5);
+        return rgb;
+      }
+
+      function hslToRgb(h, s, l) {
+        let r, g, b;
+
+        if (s === 0) {
+          r = g = b = l;
+        } else {
+          const hue2rgb = (p, q, t) => {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            if (t < 1/6) return p + (q - p) * 6 * t;
+            if (t < 1/2) return q;
+            if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+            return p;
+          };
+
+          const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+          const p = 2 * l - q;
+          r = hue2rgb(p, q, h + 1/3);
+          g = hue2rgb(p, q, h);
+          b = hue2rgb(p, q, h - 1/3);
+        }
+
+        return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+      }
+
+      async function startAudio() {
+        try {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          microphone = audioContext.createMediaStreamSource(stream);
+          microphone.connect(analyser);
+          
+          isAudioActive = true;
+          updateVolume();
+        } catch (error) {
+          logError("マイクの初期化に失敗しました: " + error.message);
+        }
+      }
+
+      function stopAudio() {
+        if (microphone) {
+          microphone.disconnect();
+          microphone = null;
+        }
+        if (audioContext) {
+          audioContext.close();
+          audioContext = null;
+        }
+        isAudioActive = false;
+        updateLED([0, 0, 0]);
+      }
+
+      function updateVolume() {
+        if (!isAudioActive) return;
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(dataArray);
+        
+        // 音量の計算（0-255の範囲）
+        const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+        const volume = Math.min(255, Math.max(0, average));
+        
+        // UIの更新
+        const volumePercent = (volume / 255) * 100;
+        document.getElementById('volume-level').style.width = volumePercent + '%';
+        document.getElementById('volume-value').textContent = `音量: ${Math.round(volumePercent)}%`;
+        
+        // 音声トリガーのチェック
+        const threshold = parseInt(document.getElementById('threshold').value);
+        const now = Date.now();
+        
+        if (volumePercent > threshold && now - lastTriggerTime > TRIGGER_COOLDOWN) {
+          toggleMode();
+          lastTriggerTime = now;
+        }
+        
+        // LEDの更新
+        if (currentMode === 'normal') {
+          const brightness = Math.floor((volume / 255) * 100);
+          updateLED([brightness, brightness, brightness]);
+        } else {
+          updateLED(getColorModeColor());
+        }
+        
+        requestAnimationFrame(updateVolume);
+      }
+
+      function initVoiceRecognition() {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+          logError("このブラウザは音声認識をサポートしていません");
+          return;
+        }
+
+        recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+        recognition.lang = 'ja-JP';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+
+        recognition.onstart = () => {
+          isListening = true;
+          document.getElementById('voice-status').textContent = '認識中';
+        };
+
+        recognition.onend = () => {
+          isListening = false;
+          document.getElementById('voice-status').textContent = '停止中';
+        };
+
+        recognition.onresult = (event) => {
+          const result = event.results[event.results.length - 1];
+          if (result.isFinal) {
+            const command = result[0].transcript.trim();
+            handleVoiceCommand(command);
+          }
+        };
+
+        recognition.onerror = (event) => {
+          logError("音声認識エラー: " + event.error);
+        };
+      }
+
+      function handleVoiceCommand(command) {
+        console.log("認識されたコマンド:", command);
+        
+        // コマンドの処理
+        if (VOICE_COMMANDS[command]) {
+          const mode = VOICE_COMMANDS[command];
+          if (mode === 'toggle') {
+            toggleMode();
+          } else {
+            currentMode = mode;
+            document.getElementById('current-mode').textContent = 
+              mode === 'normal' ? '通常モード' : 'カラーモード';
+          }
+        }
+      }
+
+      function startVoiceRecognition() {
+        if (!recognition) {
+          initVoiceRecognition();
+        }
+        if (!isListening) {
+          recognition.start();
+        }
+      }
+
+      function stopVoiceRecognition() {
+        if (recognition && isListening) {
+          recognition.stop();
+        }
+      }
+
+      obniz.onconnect = async function () {
+        console.log("接続成功");
+        updateStatus("接続中", true);
+        connectionStartTime = new Date();
+        leds = obniz.wired("WS2812", { din: 26 });
+
+        setInterval(updateConnectionTime, 1000);
+
+        // ボタンイベントリスナーの設定
+        document.getElementById('start-audio').addEventListener('click', startAudio);
+        document.getElementById('stop-audio').addEventListener('click', stopAudio);
+        document.getElementById('start-voice').addEventListener('click', startVoiceRecognition);
+        document.getElementById('stop-voice').addEventListener('click', stopVoiceRecognition);
+        
+        // 閾値スライダーのイベントリスナー
+        document.getElementById('threshold').addEventListener('input', function() {
+          document.getElementById('threshold-value').textContent = this.value;
+        });
+      };
+
+      obniz.onclose = async function() {
+        console.log("接続が切れました。再接続を試みます。");
+        updateStatus("切断 - 再接続待機中", false);
+        
+        setTimeout(() => {
+          if (!isConnected()) {
+            console.log("再接続を試みています...");
+            obniz.connect();
+          }
+        }, 5000);
+      };
+
+      obniz.onerror = function(error) {
+        console.error("Obnizエラー:", error);
+        updateStatus("エラーが発生しました", false);
+      };
+
+      window.addEventListener('beforeunload', () => {
+        stopAudio();
+        if (obniz && obniz.close) {
+          obniz.close();
+        }
+      });
+    </script>
+  </body>
+</html>
